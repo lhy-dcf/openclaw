@@ -5,10 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { Agent, fetch as fetchWithDispatcher } from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveCodexWorkerAppServerCommand } from "../../../extensions/codex/api.js";
 import type { OpenClawConfig } from "../../config/types.js";
 import { ensureDevicePairSetupBootstrapToken } from "../../infra/device-bootstrap.js";
 import { decodePairingSetupCode } from "../../pairing/setup-code.js";
+import { loadBundledPluginPublicArtifactModuleSync } from "../../plugins/public-surface-loader.js";
 import * as processExec from "../../process/exec.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
@@ -198,6 +198,9 @@ describe("worker node enrollment", () => {
       helperPath,
       configVersion: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
+    const { resolveCodexWorkerAppServerCommand } = loadBundledPluginPublicArtifactModuleSync<{
+      resolveCodexWorkerAppServerCommand: (env: NodeJS.ProcessEnv, required: boolean) => string;
+    }>({ dirName: "codex", artifactBasename: "worker-provisioning-api.js" });
     const command = resolveCodexWorkerAppServerCommand(process.env, true);
     expect(command).toBe("codex.app-server.stdio.v1." + enrollment.workerCodex!.configVersion);
     await fs.writeFile(helperPath, helperScript + "// changed\n");

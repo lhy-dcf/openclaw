@@ -16,6 +16,7 @@ import {
   resolvePairingGatewayUrl,
   resolvePairingSetupFromConfig,
 } from "../../pairing/setup-code.js";
+import { loadBundledPluginPublicArtifactModuleSync } from "../../plugins/public-surface-loader.js";
 import type { WorkerNodeEnrollment, WorkerNodeRuntimePreparation } from "../../plugins/types.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
 import { CLOUD_WORKER_PAIRING_SETUP_BOOTSTRAP_PROFILE } from "../../shared/device-bootstrap-profile.js";
@@ -258,8 +259,9 @@ export function createWorkerNodeEnrollmentManager(options: WorkerNodeEnrollmentM
     const { binding, enrollmentSignal, current: requireCurrent } = reserve(record, operationSignal);
     try {
       const prepared = await prepare(record, enrollmentSignal);
-      const { readCodexWorkerProvisioningBundle } =
-        await import("../../../extensions/codex/api.js");
+      const { readCodexWorkerProvisioningBundle } = loadBundledPluginPublicArtifactModuleSync<{
+        readCodexWorkerProvisioningBundle: () => WorkerNodeEnrollment["workerCodex"];
+      }>({ dirName: "codex", artifactBasename: "worker-provisioning-api.js" });
       const workerCodex = readCodexWorkerProvisioningBundle();
       requireCurrent();
       await options.store.ensureNodeEnrollment(record.environmentId);
