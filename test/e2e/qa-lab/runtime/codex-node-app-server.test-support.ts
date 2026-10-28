@@ -1,13 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import { createServer, request as forwardHttp, type ServerResponse } from "node:http";
+import { createServer } from "node:http";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { listMockCodexModelInfos } from "../../../../extensions/qa-lab/api.js";
-import { createNodeDuplexEndpoint } from "../../../../src/infra/node-duplex-framing.js";
 import { fixtureReceiptClientSource } from "../../../helpers/fixture-receipts.js";
-import { writeOpenAiResponsesSse } from "../../../helpers/openai-responses-sse.js";
+import {
+  writeOpenAiResponsesItem,
+  readLatestUserMarker,
+} from "../../../helpers/openai-responses-item.test-support.js";
 import { closeWireServer } from "./paired-node-worker-wire-fixture.js";
 
 export const MODEL_ID = "gpt-5.6-luna";
@@ -22,38 +23,6 @@ export const MARKERS = {
 export type Scenario = keyof typeof MARKERS;
 export const GATEWAY_BEARER = "p8-gateway-synthetic-decoy";
 const WORKER_BEARER = "p8-worker-synthetic-bearer";
-
-function respond(response: ServerResponse, item: Record<string, unknown>) {
-  const id = `resp_p8_${randomUUID()}`;
-  writeOpenAiResponsesSse(response, [
-    { type: "response.created", response: { id } },
-    { type: "response.output_item.done", item },
-    {
-      type: "response.completed",
-      response: {
-        id,
-        status: "completed",
-        output: [item],
-        usage: { input_tokens: 32, output_tokens: 16, total_tokens: 48 },
-      },
-    },
-  ]);
-}
-
-function scenarioFor(body: Record<string, unknown>): Scenario | undefined {
-  for (const item of (Array.isArray(body.input) ? body.input : []).toReversed()) {
-    if (isRecord(item) && item.role === "user") {
-      const text = JSON.stringify(item);
-      const scenario = (Object.keys(MARKERS) as Scenario[]).find((key) =>
-        text.includes(MARKERS[key]),
-      );
-      if (scenario) {
-        return scenario;
-      }
-    }
-  }
-  return undefined;
-}
 
 function nativeCommand(scenario: Scenario, receiptEndpoint: string): string {
   const source = [
@@ -126,7 +95,7 @@ export async function startWorkerResponses(receiptEndpoint: string) {
       if (!isRecord(body)) {
         throw new Error("Responses request was not an object");
       }
-      const scenario = scenarioFor(body);
+      const scenario = readLatestUserMarker(body, Object.entries(MARKERS) as [Scenario, string][]);
       const callId = `p8-native-${scenario}`;
       const completed = (Array.isArray(body.input) ? body.input : []).some(
         (item) => isRecord(item) && item.type === "function_call_output" && item.call_id === callId,
@@ -143,14 +112,14 @@ export async function startWorkerResponses(receiptEndpoint: string) {
         return;
       }
       if (completed) {
-        respond(response, {
+        writeOpenAiResponsesItem(response, `resp_p8_${randomUUID()}`, {
           type: "message",
           role: "assistant",
           id: `msg_${scenario}`,
           content: [{ type: "output_text", text: `${MARKERS[scenario]}_OK` }],
         });
       } else {
-        respond(response, {
+        writeOpenAiResponsesItem(response, `resp_p8_${randomUUID()}`, {
           type: "function_call",
           call_id: callId,
           name: "exec_command",
@@ -222,7 +191,7 @@ export async function stageWorkerCodex(params: {
     'const status = fs.readFileSync(`/proc/${process.ppid}/status`, "utf8");',
     "const nodePid = Number(status.match(/^PPid:\\s+(\\d+)/m)?.[1]);",
     'const nativePids = fs.readFileSync(`/proc/${nodePid}/task/${nodePid}/children`, "utf8").trim().split(/\\s+/).map(Number).filter(pid => { try { const args = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\\0"); return args.includes("app-server") || args.includes("exec-server"); } catch { return false; } });',
-    'const evidence = { nativePids, startedAt: Date.now(), helperPid: process.pid, gate, appServerPid: process.ppid, nodePid, parentAppServer: parentArgs.includes("app-server"), home: process.env.HOME, codexHome: process.env.CODEX_HOME };',
+    'const evidence = { nativePids, startedAt: Date.now(), helperPid: process.pid, gate, appServerPid: process.ppid, nodePid, parentAppServer: parentArgs.includes("app-server"), executable: fs.readlinkSync(`/proc/${process.ppid}/exe`), home: process.env.HOME, codexHome: process.env.CODEX_HOME };',
     `fs.writeFileSync(path.join(${JSON.stringify(observations)}, process.pid + ".json"), JSON.stringify(evidence), { mode: 0o600 });`,
     ...(params.receiptEndpoint
       ? [
@@ -278,206 +247,5 @@ export async function stageWorkerCodex(params: {
     authGate,
     version,
     command: `codex.app-server.stdio.v1.${version}`,
-  };
-}
-
-export type NativeMessage = {
-  invokeId: string;
-  method?: string;
-  id?: string | number;
-  params?: Record<string, unknown>;
-  result?: Record<string, unknown>;
-};
-export type ObservedInvoke = { id: string; command: string; params: Record<string, unknown> };
-function rawText(data: RawData) {
-  return (
-    Array.isArray(data)
-      ? Buffer.concat(data)
-      : data instanceof ArrayBuffer
-        ? Buffer.from(data)
-        : data
-  ).toString("utf8");
-}
-
-/** Byte-preserving observer: never answers, rewrites, injects, or drops a frame. */
-export async function observeWorkerWire(gatewayUrl: string, exactCommand: string) {
-  // Workspace artifacts share the node Gateway URL; preserve HTTP as well as WS.
-  const httpUrl = new URL(gatewayUrl);
-  httpUrl.protocol = "http:";
-  const server = createServer((request, response) => {
-    const upstream = forwardHttp(
-      new URL(request.url ?? "/", httpUrl),
-      {
-        method: request.method,
-        headers: request.headers,
-      },
-      (incoming) => {
-        response.writeHead(incoming.statusCode ?? 502, incoming.headers);
-        incoming.pipe(response);
-      },
-    );
-    upstream.on("error", () => {
-      response.writeHead(502).end();
-    });
-    request.pipe(upstream);
-  });
-  const sockets = new WebSocketServer({ server });
-  const peers = new Set<{ upstream: WebSocket; downstream: WebSocket }>();
-  const invokes: ObservedInvoke[] = [];
-  const requests: NativeMessage[] = [];
-  const responses: NativeMessage[] = [];
-  const cancelled = new Set<string>();
-  const errors: unknown[] = [];
-  const decoders = new Map<string, ReturnType<typeof createNodeDuplexEndpoint>>();
-  function receive(id: string, direction: "request" | "response", frame: string) {
-    const key = `${id}:${direction}`;
-    let decoder = decoders.get(key);
-    if (!decoder) {
-      decoder = createNodeDuplexEndpoint({
-        sendFrame: () => {
-          throw new Error("Observer cannot send");
-        },
-      });
-      decoder.onMessage((bytes) => {
-        const parsed: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
-        if (!isRecord(parsed)) {
-          throw new Error("Native message is not an object");
-        }
-        const message: NativeMessage = {
-          invokeId: id,
-          ...(typeof parsed.method === "string" ? { method: parsed.method } : {}),
-          ...(typeof parsed.id === "number" || typeof parsed.id === "string"
-            ? { id: parsed.id }
-            : {}),
-          ...(isRecord(parsed.params) ? { params: parsed.params } : {}),
-          ...(isRecord(parsed.result) ? { result: parsed.result } : {}),
-        };
-        (direction === "request" ? requests : responses).push(message);
-      });
-      decoders.set(key, decoder);
-    }
-    decoder.receive(frame);
-  }
-  function observe(data: RawData, fromGateway: boolean) {
-    try {
-      const frame: unknown = JSON.parse(rawText(data));
-      if (!isRecord(frame)) {
-        return;
-      }
-      const payload = fromGateway ? frame.payload : frame.params;
-      if (!isRecord(payload)) {
-        return;
-      }
-      if (
-        fromGateway &&
-        frame.event === "node.invoke.request" &&
-        typeof payload.command === "string" &&
-        typeof payload.id === "string"
-      ) {
-        invokes.push({
-          id: payload.id,
-          command: payload.command,
-          params:
-            typeof payload.paramsJSON === "string"
-              ? (JSON.parse(payload.paramsJSON) as Record<string, unknown>)
-              : isRecord(payload.params)
-                ? payload.params
-                : {},
-        });
-      }
-      const invokeId =
-        fromGateway && frame.event === "node.invoke.input" ? payload.id : payload.invokeId;
-      if (
-        typeof invokeId !== "string" ||
-        !invokes.some((entry) => entry.id === invokeId && entry.command === exactCommand)
-      ) {
-        return;
-      }
-      if (fromGateway && frame.event === "node.invoke.cancel") {
-        cancelled.add(invokeId);
-      }
-      if (
-        fromGateway &&
-        frame.event === "node.invoke.input" &&
-        typeof payload.payloadJSON === "string"
-      ) {
-        receive(invokeId, "request", payload.payloadJSON);
-      }
-      if (
-        !fromGateway &&
-        frame.method === "node.invoke.progress" &&
-        typeof payload.chunk === "string"
-      ) {
-        receive(invokeId, "response", payload.chunk);
-      }
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  sockets.on("connection", (downstream, request) => {
-    const upstream = new WebSocket(new URL(request.url ?? "/", gatewayUrl));
-    const peer = { upstream, downstream };
-    peers.add(peer);
-    const pending: Array<{ data: RawData; isBinary: boolean }> = [];
-    downstream.on("message", (data, isBinary) => {
-      observe(data, false);
-      if (upstream.readyState === WebSocket.OPEN) {
-        upstream.send(data, { binary: isBinary });
-      } else {
-        pending.push({ data, isBinary });
-      }
-    });
-    upstream.on("open", () => {
-      for (const { data, isBinary } of pending.splice(0)) {
-        upstream.send(data, { binary: isBinary });
-      }
-    });
-    upstream.on("message", (data, isBinary) => {
-      observe(data, true);
-      if (downstream.readyState === WebSocket.OPEN) {
-        downstream.send(data, { binary: isBinary });
-      }
-    });
-    const close = () => {
-      peers.delete(peer);
-      upstream.terminate();
-      downstream.terminate();
-    };
-    upstream.on("error", close);
-    downstream.on("error", close);
-    upstream.on("close", close);
-    downstream.on("close", close);
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Worker wire observer did not bind");
-  }
-  return {
-    port: address.port,
-    invokes,
-    requests,
-    responses,
-    cancelled,
-    errors,
-    get connectionCount() {
-      return peers.size;
-    },
-    async close() {
-      for (const decoder of decoders.values()) {
-        decoder.close();
-      }
-      for (const peer of peers) {
-        peer.upstream.terminate();
-        peer.downstream.terminate();
-      }
-      await new Promise<void>((resolve) => {
-        sockets.close(() => resolve());
-      });
-      await closeWireServer(server);
-    },
   };
 }

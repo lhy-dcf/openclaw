@@ -21,7 +21,7 @@ import {
 import type { NodeWorkerWorkspaceProcesses } from "./node-worker-workspace-processes.js";
 
 /** Workspace custody and its admitted process environment share one release/currentness fence. */
-export function createNodeWorkerManagedWorkspaceLease(params: {
+function createNodeWorkerManagedWorkspaceLease(params: {
   workspaceDir: string;
   homeDir?: string;
   env: NodeJS.ProcessEnv;

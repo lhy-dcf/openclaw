@@ -203,53 +203,6 @@ describe("Codex local tool environment placement", () => {
   );
 });
 
-it("selects the enrolled worker client without forwarding Gateway auth or local environment", async () => {
-  provisionWorker();
-  const params = createParams(path.join(tempDir, "worker.jsonl"), path.join(tempDir, "workspace"));
-  params.permissionMode = "full";
-  const sandbox = {
-    ...createSandboxContext({}),
-    backendId: "node",
-    placementExecutionMode: "remote-exec",
-    placementNodeId: "worker-node",
-    placementEnvironmentId: "worker-environment",
-    placementSessionId: params.sessionId,
-    placementOwnerEpoch: 1,
-  };
-  params.sandbox = sandbox;
-  const runtime = createPluginRuntimeMock();
-  const open = vi
-    .spyOn(runtime.nodes, "openDuplex")
-    .mockRejectedValue(new Error("fixture worker dispatch reached"));
-  const connection = await prepareCodexAttemptConnection({
-    params,
-    options: {
-      bindingStore: testCodexAppServerBindingStore,
-      runtime,
-      pluginConfig: { appServer: { workerHostedCloud: true } },
-    },
-  });
-  try {
-    expect(connection.workerHostedCloud).toBe(true);
-    expect(connection.callerOwnedAttemptClient).toBe(true);
-    expect(connection.startupPreparedAuth).toBeUndefined();
-    expect(connection.appServer.connectionClass).toBe("remote");
-    expect(connection.effectiveWorkspace).toBe(params.sandbox.containerWorkdir);
-    await expect(connection.attemptClientFactory()).rejects.toThrow(
-      "fixture worker dispatch reached",
-    );
-    expect(open).toHaveBeenCalledOnce();
-    expect(open.mock.calls[0]?.[0]).toMatchObject({
-      nodeId: "worker-node",
-      params: { authorization: "session-full" },
-    });
-  } finally {
-    connection.cancellation.dispose();
-    connection.releaseModelExecution();
-    connection.releaseBindingAuthority();
-  }
-});
-
 it.each(["api-key", "subscription"] as const)(
   "keeps worker %s route constraints through actual client startup without local login",
   async (authRequirement) => {
@@ -292,7 +245,7 @@ it.each(["api-key", "subscription"] as const)(
     const closed = Promise.withResolvers<void>();
     let receive: ((frame: Uint8Array) => void | Promise<void>) | undefined;
     const methods: string[] = [];
-    vi.spyOn(runtime.nodes, "openDuplex").mockImplementation(async () => ({
+    const open = vi.spyOn(runtime.nodes, "openDuplex").mockImplementation(async () => ({
       send: async (frame) => {
         const request = JSON.parse(Buffer.from(frame).toString("utf8")) as {
           id?: string | number;
@@ -339,6 +292,13 @@ it.each(["api-key", "subscription"] as const)(
           (error: unknown) => error,
         );
       expect(outcome).toMatchObject({ status: 401 });
+      expect(connection.effectiveWorkspace).toBe(sandbox.containerWorkdir);
+      expect(open).toHaveBeenCalledWith(
+        expect.objectContaining({
+          nodeId: "worker-node",
+          params: expect.objectContaining({ authorization: "session-full" }),
+        }),
+      );
       expect(connection.startupAuthRequirement).toBe(authRequirement);
       expect(connection.startupClientAuthProfileId).toBeNull();
       expect(connection.startupPreparedAuth).toBeUndefined();

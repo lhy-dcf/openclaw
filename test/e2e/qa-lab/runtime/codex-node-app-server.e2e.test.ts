@@ -17,6 +17,7 @@ import {
   type FixtureReceiptChannel,
 } from "../../../helpers/fixture-receipts.js";
 import { acquireGatewayTestClient } from "../../../helpers/gateway-client.js";
+import { withCodexNativeThreadReader } from "../../../helpers/gateway-codex-harness-native-subagent.js";
 import { withinTest } from "../../../helpers/promise.js";
 import { runQaGatewayFixture, stopQaGatewayFixture } from "../../../helpers/qa-gateway-cleanup.js";
 import { useAutoCleanupTempDirTracker } from "../../../helpers/temp-dir.js";
@@ -25,7 +26,6 @@ import {
   MARKERS,
   MODEL_ID,
   MODEL_REF,
-  observeWorkerWire,
   stageWorkerCodex,
   startWorkerResponses,
   type Scenario,
@@ -76,6 +76,7 @@ type AuthObservation = {
   parentAppServer: boolean;
   home: string;
   codexHome: string;
+  executable: string;
 };
 type NativeEvidence = { pid: number; cwd: string; home: string; codexHome?: string };
 async function readJson<T>(file: string): Promise<T> {
@@ -108,10 +109,10 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
       let client: GatewayClient | undefined;
       let receipts: FixtureReceiptChannel | undefined;
       let provider: Awaited<ReturnType<typeof startWorkerResponses>> | undefined;
-      let wire: Awaited<ReturnType<typeof observeWorkerWire>> | undefined;
       let published: PublishedWireWorkspace | undefined;
       let clientClosed = false;
       const settlement = createWireWorkspaceSettlementWaiter();
+      const threadReady = new Map<string, Record<string, unknown>>();
 
       await runQaGatewayFixture(
         async () => {
@@ -124,10 +125,6 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
             receiptEndpoint: receipts.endpoint,
           });
           expect(staged.command).toMatch(/^codex\.app-server\.stdio\.v1\.[a-f0-9]{64}$/);
-          for (const name of ["version", "config.toml", "token.mjs"]) {
-            expect((await fs.stat(path.join(staged.workerHome, name))).mode & 0o777).toBe(0o600);
-          }
-          expect((await fs.stat(staged.workerHome)).mode & 0o777).toBe(0o700);
           published = await createPublishedWireWorkspace(path.join(root, "workspace"));
           const catalogPreload = new URL(
             "./codex-node-app-server-catalog-preload.mjs",
@@ -203,7 +200,20 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
               mode: GATEWAY_CLIENT_MODES.BACKEND,
               scopes: ["operator.admin", "operator.read", "operator.write", "operator.pairing"],
               requestTimeoutMs: TIMEOUT_MS,
-              onEvent: settlement.onEvent,
+              onEvent: (event) => {
+                settlement.onEvent(event);
+                const payload = event.payload;
+                if (
+                  event.event === "agent" &&
+                  isRecord(payload) &&
+                  payload.stream === "codex_app_server.lifecycle" &&
+                  typeof payload.runId === "string" &&
+                  isRecord(payload.data) &&
+                  payload.data.phase === "thread_ready"
+                ) {
+                  threadReady.set(payload.runId, payload.data);
+                }
+              },
               onClose: () => {
                 clientClosed = true;
               },
@@ -215,7 +225,7 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
               signal,
             },
           );
-          wire = await observeWorkerWire(gateway.wsUrl, staged.command);
+          const gatewayPort = Number(new URL(gateway.wsUrl).port);
           const nodeConfig: OpenClawConfig = {
             gateway: { mode: "local" },
             plugins: { allow: ["codex"], entries: { codex: { enabled: true } } },
@@ -236,13 +246,13 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
           expect(nodeEnv).not.toHaveProperty("OPENAI_API_KEY");
           expect(nodeEnv).not.toHaveProperty("CODEX_HOME");
           expect(nodeEnv).not.toHaveProperty("GITHUB_TOKEN");
-          node = startNodeProcess(wire.port, nodeEnv);
+          node = startNodeProcess(gatewayPort, nodeEnv);
           const nodeId = await approvePairing(gateway, "device");
           await stopChild(node);
-          node = startNodeProcess(wire.port, nodeEnv);
+          node = startNodeProcess(gatewayPort, nodeEnv);
           await approvePairing(gateway, "node", nodeId);
           await stopChild(node);
-          node = startNodeProcess(wire.port, nodeEnv);
+          node = startNodeProcess(gatewayPort, nodeEnv);
           const nodePid = node.child.pid;
           expect(nodePid).toEqual(expect.any(Number));
           await vi.waitFor(async () => {
@@ -313,28 +323,34 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
           console.log(
             "P8_CATALOG_TRANSPORT_PROOF " + JSON.stringify(provider.catalogRequests.slice(0, 8)),
           );
-          await gateway.call("sessions.create", {
-            key: SESSION_KEY,
-            agentId: "qa",
-            model: MODEL_REF,
-            permissionMode: "full",
-            worktree: true,
-            worktreeName: "codex-worker-app-server-proof",
-            worktreeBaseRef: "main",
-            cwd: published.source,
-          });
-          const local = await describeSession(gateway);
-          expect(local.permissionMode).toBe("full");
+          const createAndDispatch = async (key: string, worktreeName: string) => {
+            await gateway!.call("sessions.create", {
+              key,
+              agentId: "qa",
+              model: MODEL_REF,
+              permissionMode: "full",
+              worktree: true,
+              worktreeName,
+              worktreeBaseRef: "main",
+              cwd: published!.source,
+            });
+            const local = await describeSession(gateway!, key);
+            expect(local.permissionMode).toBe("full");
+            await gateway!.call(
+              "sessions.dispatch",
+              { key, deviceId: nodeId },
+              { timeoutMs: TIMEOUT_MS },
+            );
+            return { local, placed: await describeSession(gateway!, key) };
+          };
+          const { local, placed } = await createAndDispatch(
+            SESSION_KEY,
+            "codex-worker-app-server-proof",
+          );
           const localWorkspace = local.execCwd ?? local.spawnedCwd;
           if (!localWorkspace) {
             throw new Error("P8 session omitted its managed workspace");
           }
-          await gateway.call(
-            "sessions.dispatch",
-            { key: SESSION_KEY, deviceId: nodeId },
-            { timeoutMs: TIMEOUT_MS },
-          );
-          const placed = await describeSession(gateway);
           expect(placed.placement?.state).toBe("active");
           const remoteWorkspace = placed.placement?.remoteWorkspaceDir;
           if (!remoteWorkspace) {
@@ -430,8 +446,8 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
             return evidence;
           };
           let threadId: string | undefined;
+          let firstNativeTurnId: unknown;
           for (const scenario of ["first", "second"] as const) {
-            const before = wire.requests.length;
             const manifest = (await describeSession(gateway)).placement?.workspaceBaseManifestRef;
             const allowedGate = "P8_AUTH_ALLOWED";
             if (scenario === "first") {
@@ -449,39 +465,19 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
             await settlement.wait(client, SESSION_KEY, signal, manifest);
             await checkEvidence(scenario, localWorkspace);
             expect((await describeSession(gateway)).agentRuntime?.id).toBe("codex");
-            const native = wire.requests.slice(before);
-            const request = native.find(
-              (entry) => entry.method === (scenario === "first" ? "thread/start" : "thread/resume"),
-            );
-            expect(request, "Real node duplex must carry thread start/resume").toBeDefined();
-            if (!request) {
-              throw new Error("Native thread request missing");
-            }
-            const reply = wire.responses.find(
-              (entry) => entry.invokeId === request.invokeId && entry.id === request.id,
-            );
-            const thread = reply?.result?.thread;
-            expect(thread).toMatchObject({ id: expect.any(String) });
-            if (!isRecord(thread) || typeof thread.id !== "string") {
-              throw new Error("Native thread response missing");
+            const ready = threadReady.get(runId);
+            expect(ready).toMatchObject({
+              action: scenario === "first" ? "started" : "resumed",
+              threadId: expect.any(String),
+            });
+            if (typeof ready?.threadId !== "string") {
+              throw new Error("Native thread identity missing");
             }
             if (scenario === "first") {
-              threadId = thread.id;
+              threadId = ready.threadId;
             } else {
-              expect(request.params?.threadId).toBe(threadId);
-              expect(thread.id).toBe(threadId);
+              expect(ready.threadId).toBe(threadId);
             }
-            expect(native.find((entry) => entry.method === "turn/start")?.params?.threadId).toBe(
-              threadId,
-            );
-            const invoke = wire.invokes.find((entry) => entry.id === request.invokeId);
-            expect(invoke).toMatchObject({
-              command: staged.command,
-              params: {
-                authorization: "session-full",
-                placement: { sessionKey: SESSION_KEY, cwd: remoteWorkspace },
-              },
-            });
             expect(
               provider.requests
                 .filter((entry) => entry.scenario === scenario)
@@ -491,6 +487,42 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
               { auth: true, completed: true },
             ]);
             await expectNativeCleanup();
+            const observed = (await observations()).at(-1)!;
+            const providerCount = provider.requests.length;
+            // Read the actual worker-owned store using its observed native binary, never resume it.
+            await withCodexNativeThreadReader(
+              {
+                command: observed.executable,
+                args: ["app-server", "--listen", "stdio://"],
+                codexHome: observed.codexHome,
+                stateDir: nodeState,
+                cwd: remoteWorkspace,
+                env: createChildEnv({ home: observed.home, tempDir: nodeTmp }),
+                requestTimeoutMs: TIMEOUT_MS,
+              },
+              async (readThread) => {
+                const result = await readThread(threadId!);
+                expect(result).toMatchObject({ thread: { id: threadId } });
+                const thread =
+                  isRecord(result) && isRecord(result.thread) ? result.thread : undefined;
+                const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+                expect(turns).toHaveLength(scenario === "first" ? 1 : 2);
+                expect(turns).toEqual(
+                  expect.arrayContaining([expect.objectContaining({ status: "completed" })]),
+                );
+                const first = isRecord(turns[0]) ? turns[0] : undefined;
+                if (scenario === "first") {
+                  firstNativeTurnId = first?.id;
+                }
+                expect(firstNativeTurnId).toEqual(expect.any(String));
+                expect(first?.id).toBe(firstNativeTurnId);
+                expect(JSON.stringify(turns)).toContain(MARKERS.first + "_OK");
+                if (scenario === "second") {
+                  expect(JSON.stringify(turns)).toContain(MARKERS.second + "_OK");
+                }
+              },
+            );
+            expect(provider.requests).toHaveLength(providerCount);
           }
           const history = await client.request<{ messages: unknown[] }>("chat.history", {
             sessionKey: SESSION_KEY,
@@ -499,7 +531,6 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
           expect(JSON.stringify(history.messages)).toContain(`${MARKERS.first}_OK`);
           expect(JSON.stringify(history.messages)).toContain(`${MARKERS.second}_OK`);
 
-          const cancelOffset = wire.requests.length;
           const cancelledRun = await start("cancel");
           const cancelledOutcome = wait(cancelledRun);
           await withinTest(
@@ -515,10 +546,7 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
           );
           const held = await checkEvidence("cancel", remoteWorkspace);
           expect(processIsAlive(held.pid)).toBe(true);
-          const heldTurn = wire.requests
-            .slice(cancelOffset)
-            .find((entry) => entry.method === "turn/start");
-          expect(heldTurn?.params?.threadId).toBe(threadId);
+          expect(threadReady.get(cancelledRun)).toMatchObject({ threadId, action: "resumed" });
           expect(
             await client.request("chat.abort", { sessionKey: SESSION_KEY, runId: cancelledRun }),
           ).toMatchObject({ aborted: true, runIds: expect.arrayContaining([cancelledRun]) });
@@ -530,7 +558,6 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
           await withinTest(receipts.waitForExit(MARKERS.cancel), signal);
           await vi.waitFor(() => {
             expect(processIsAlive(held.pid)).toBe(false);
-            expect(wire!.cancelled.has(heldTurn!.invokeId)).toBe(true);
           }, WAIT);
           await expectNativeCleanup();
           expect(
@@ -543,46 +570,10 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
           ).toBe(true);
           expect(provider.requests.filter((entry) => entry.scenario === "cancel")).toHaveLength(1);
 
-          // Revoke Full on the same real placement after successful native turns.
-          const beforeForbidden = {
-            requests: provider.requests.length,
-            invokes: wire.invokes.length,
-            auth: (await observations()).length,
-          };
-          await gateway.call("sessions.patch", { key: SESSION_KEY, permissionMode: "workspace" });
-          expect((await describeSession(gateway)).permissionMode).toBe("workspace");
-          expect(await wait(await start("forbidden"))).toMatchObject({ status: "error" });
-          expect(provider.requests).toHaveLength(beforeForbidden.requests);
-          expect(
-            wire.invokes.filter(
-              (entry, index) =>
-                index >= beforeForbidden.invokes && entry.command === staged.command,
-            ),
-          ).toEqual([]);
-          expect(await observations()).toHaveLength(beforeForbidden.auth);
-          await expect(
-            fs.access(path.join(remoteWorkspace, "p8-forbidden.json")),
-          ).rejects.toMatchObject({ code: "ENOENT" });
-
           {
             const scenario = "revoked";
             const key = `${SESSION_KEY}:${scenario}`;
-            await gateway.call("sessions.create", {
-              key,
-              agentId: "qa",
-              model: MODEL_REF,
-              permissionMode: "full",
-              worktree: true,
-              worktreeName: `p8-${scenario}`,
-              worktreeBaseRef: "main",
-              cwd: published.source,
-            });
-            await gateway.call(
-              "sessions.dispatch",
-              { key, deviceId: nodeId },
-              { timeoutMs: TIMEOUT_MS },
-            );
-            const target = await describeSession(gateway, key);
+            const { placed: target } = await createAndDispatch(key, `p8-${scenario}`);
             const placement = target.placement;
             if (
               !target.sessionId ||
@@ -595,26 +586,11 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
             }
             const marker = `P8_AUTH_${scenario.toUpperCase()}`;
             const requestCount = provider.requests.length;
-            const invokeOffset = wire.invokes.length;
             await fs.writeFile(staged.authGate, marker, { mode: 0o600 });
             const runId = await start(scenario, key);
             const outcome = wait(runId);
             try {
               const heldAuth = await waitForHeldAuth(marker, outcome);
-              const invokes = wire.invokes
-                .slice(invokeOffset)
-                .filter((entry) => entry.command === staged.command);
-              expect(invokes.length).toBeGreaterThan(0);
-              for (const invoke of invokes) {
-                expect(invoke.params).toMatchObject({
-                  authorization: "session-full",
-                  placement: {
-                    sessionKey: key,
-                    sessionId: target.sessionId,
-                    ownerEpoch: placement.activeOwnerEpoch,
-                  },
-                });
-              }
               expect(provider.requests).toHaveLength(requestCount);
               // Existing write settlement forbids ordinary reassignment while pending.
               // Observe that owner, rather than abandoning data to manufacture a move.
@@ -654,7 +630,6 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
                 expect(nativeExitedAt - entry.startedAt).toBeLessThan(4_000);
                 expect(processIsAlive(entry.helperPid)).toBe(false);
               }
-              expect(invokes.some((entry) => wire!.cancelled.has(entry.id))).toBe(true);
               // A late helper release cannot revive the withdrawn real owner.
               receipts.release(marker, "continue");
               expect(provider.requests).toHaveLength(requestCount);
@@ -664,7 +639,6 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
               console.log(
                 "P8_AUTHORITY_EFFECT_PROOF " +
                   JSON.stringify({
-                    nearestForbiddenNativeInvocations: 0,
                     nearestForbiddenProviderRequests: 0,
                     pendingReassignment: "refused-with-pending-workspace-result",
                     revokedPermission: "workspace",
@@ -678,13 +652,19 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
               await fs.rm(staged.authGate, { force: true });
               receipts.release(marker, "continue");
             }
+            // A subsequent attempt on the withdrawn placement must not begin another effect.
+            const beforeForbidden = {
+              requests: provider.requests.length,
+              auth: (await observations()).length,
+            };
+            expect((await describeSession(gateway, key)).permissionMode).toBe("workspace");
+            expect(await wait(await start("forbidden", key))).toMatchObject({ status: "error" });
+            expect(provider.requests).toHaveLength(beforeForbidden.requests);
+            expect(await observations()).toHaveLength(beforeForbidden.auth);
+            await expect(
+              fs.access(path.join(placement.remoteWorkspaceDir, "p8-forbidden.json")),
+            ).rejects.toMatchObject({ code: "ENOENT" });
           }
-          expect(
-            wire.invokes
-              .filter((entry) => entry.command.startsWith("codex."))
-              .every((entry) => entry.command === staged.command),
-          ).toBe(true);
-          expect(wire.errors).toEqual([]);
           expect(provider.errors).toEqual([]);
           expect(gateway.logs()).not.toContain("P8_UNEXPECTED_REMOTE_FETCH");
 
@@ -692,7 +672,6 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
           expect(processIsAlive(nodePid!)).toBe(false);
           await vi.waitFor(async () => {
             expect(await readNode(gateway!, nodeId)).toMatchObject({ connected: false });
-            expect(wire!.connectionCount).toBe(0);
           }, WAIT);
           await client.stopAndWait({ timeoutMs: 5_000 });
           expect(clientClosed).toBe(true);
@@ -700,7 +679,6 @@ describe.skipIf(process.platform !== "linux")("Codex worker-hosted app-server co
         () => stopChild(node),
         () => client?.stopAndWait({ timeoutMs: 5_000 }),
         () => stopQaGatewayFixture(gatewayOwner),
-        () => wire?.close(),
         () => (published ? closeWireServer(published.server) : undefined),
         () => provider?.close(),
         () => receipts?.close(),

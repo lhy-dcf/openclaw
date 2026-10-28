@@ -45,8 +45,8 @@ describe("resolveCodexProviderWebSearchSupport", () => {
 
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-  it.each(["success", "RPC failure", "timeout"] as const)(
-    "awaits isolated capability probe exit after %s",
+  it.each(["success", "RPC failure", "timeout", "borrowed success"] as const)(
+    "preserves capability client ownership after %s",
     async (result) => {
       vi.useFakeTimers();
       const agentDir = tempDirs.make("codex-capability-probe-");
@@ -75,8 +75,11 @@ describe("resolveCodexProviderWebSearchSupport", () => {
       });
       vi.spyOn(CodexAppServerClient, "start").mockResolvedValue(harness.client);
       const stdinClosed = once(harness.process.stdin, "close");
+      const borrowed = result === "borrowed success";
       const pending = resolveSupport({
-        clientFactory: createIsolatedCodexAppServerClient,
+        clientFactory: borrowed
+          ? (options) => createIsolatedCodexAppServerClient(options)
+          : createIsolatedCodexAppServerClient,
         appServer: {
           ...appServer,
           start: { transport: "stdio", command: process.execPath, args: [], headers: {} },
@@ -93,6 +96,15 @@ describe("resolveCodexProviderWebSearchSupport", () => {
         if (result === "timeout") {
           await vi.advanceTimersByTimeAsync(appServer.requestTimeoutMs);
         }
+        if (borrowed) {
+          await expect(outcome).resolves.toBe("supported");
+          await expect(
+            harness.client.request("modelProvider/capabilities/read", {}),
+          ).resolves.toEqual({
+            webSearch: true,
+          });
+          return;
+        }
         await awaitGateBeforeSettlement(stdinClosed, outcome, "probe returned without closing");
         expect(settled).toBe(false);
         expect(harness.process.exitCode).toBeNull();
@@ -104,47 +116,6 @@ describe("resolveCodexProviderWebSearchSupport", () => {
       }
     },
   );
-
-  it("keeps a borrowed isolated client alive after a capability probe", async () => {
-    const agentDir = tempDirs.make("codex-borrowed-capability-");
-    const harness = createClientHarness({
-      onWrite: (line, send) => {
-        const { id, method } = JSON.parse(line);
-        if (id !== undefined) {
-          send({
-            id,
-            result:
-              method === "initialize"
-                ? { userAgent: `codex-cli/${CODEX_APP_SERVER_VERSION}` }
-                : { webSearch: true },
-          });
-        }
-      },
-    });
-    vi.spyOn(CodexAppServerClient, "start").mockResolvedValue(harness.client);
-    let borrowed: CodexAppServerClient | undefined;
-    const borrow: CodexAppServerClientFactory = async (options) =>
-      (borrowed ??= await createIsolatedCodexAppServerClient(options));
-    try {
-      await expect(
-        resolveSupport({
-          clientFactory: borrow,
-          appServer: {
-            ...appServer,
-            start: { transport: "stdio", command: process.execPath, args: [], headers: {} },
-          },
-          authProfileId: null,
-          agentDir,
-        }),
-      ).resolves.toBe("supported");
-      await expect(harness.client.request("modelProvider/capabilities/read", {})).resolves.toEqual({
-        webSearch: true,
-      });
-    } finally {
-      harness.emitExit();
-      await harness.client.closeAndWait();
-    }
-  });
 
   it("reads the latest configured provider capability for each attempt", async () => {
     request.mockResolvedValueOnce({ webSearch: true });

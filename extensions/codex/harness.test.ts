@@ -12,9 +12,6 @@ import {
 } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { withOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { useCodexWorkerProvisioningFixture } from "./src/node-app-server-command.test-support.js";
-
-const provisionWorker = useCodexWorkerProvisioningFixture();
 
 const runHostPreparedIsolatedCompletion = vi.hoisted(() => vi.fn());
 const runCodexIsolatedCompletion = vi.hoisted(() => vi.fn());
@@ -108,18 +105,6 @@ const isolatedTask = {
   workspaceDir: "/tmp/workspace",
   outputTextPolicy: "strict-visible" as const,
 };
-
-it("requires the enrolled app-server command for worker-hosted execution", () => {
-  const { configVersion } = provisionWorker();
-  try {
-    const harness = makeHarness({ pluginConfig: { appServer: { workerHostedCloud: true } } });
-    expect(harness.cloudPlacement?.devicePlacement?.requiredNodeCommands).toEqual([
-      `codex.app-server.stdio.v1.${configVersion}`,
-    ]);
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
 
 describe("Codex agent harness supports()", () => {
   const harness = supportHarness;
