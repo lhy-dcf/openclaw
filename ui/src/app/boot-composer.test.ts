@@ -37,7 +37,13 @@ describe("boot composer", () => {
     settleBootComposer();
     expect(document.activeElement).toBe(textarea);
 
-    expect(takeBootComposer()).toEqual({ text: "Ship it", submit: true, focused: true });
+    textarea.setSelectionRange(2, 4, "backward");
+    expect(takeBootComposer()).toEqual({
+      text: "Ship it",
+      submit: true,
+      focused: true,
+      selection: [2, 4, "backward"],
+    });
     expect(textarea.isConnected).toBe(false);
     expect(takeBootComposer()).toBeNull();
   });
@@ -47,7 +53,7 @@ describe("boot composer", () => {
     adoptBootComposer(true);
     settleBootComposer();
     expect(document.activeElement).not.toBe(textarea);
-    expect(takeBootComposer()).toEqual({ text: "", submit: false, focused: false });
+    expect(takeBootComposer()).toMatchObject({ text: "", submit: false, focused: false });
   });
 
   it("discards early input when history leaves the linked session", () => {

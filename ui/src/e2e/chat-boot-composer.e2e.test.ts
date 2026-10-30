@@ -89,6 +89,10 @@ suite.define(() => {
         await page.keyboard.type(text);
         await page.keyboard.press(name === "phone" ? "Enter" : "Shift+Enter");
         await page.keyboard.type("second line");
+        // The caret moves into the draft; the handoff must keep it there.
+        for (let index = 0; index < "line".length; index += 1) {
+          await page.keyboard.press("ArrowLeft");
+        }
         const geometry = (selector: string) =>
           page.locator(selector).evaluate((element) => {
             const box = element.getBoundingClientRect();
@@ -149,7 +153,7 @@ suite.define(() => {
         ]);
         expect(await composer.evaluate((el) => el === document.activeElement)).toBe(true);
         await page.keyboard.type("!");
-        expect(await composer.inputValue()).toBe(`${draft}!`);
+        expect(await composer.inputValue()).toBe(`${text}\nsecond !line`);
         expect(await gateway.getRequests("chat.send")).toHaveLength(0);
       });
     },

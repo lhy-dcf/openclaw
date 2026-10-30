@@ -6,9 +6,16 @@ import { listen } from "../lib/reactive/listener.ts";
  * resolves. The document's inline boot script owns its keys until then: Enter
  * only records intent and focus is recorded on the element. This module carries
  * that one element through the app's loading frames until the route's chat pane
- * takes it; the pane's composer submits through its normal admission.
+ * takes it; the pane's composer submits through its normal admission. An IME
+ * composition open across a frame move commits its text; only the candidate
+ * window restarts (accepted: rare, visible and recoverable).
  */
-export type BootComposerDraft = { text: string; submit: boolean; focused: boolean };
+export type BootComposerDraft = {
+  text: string;
+  submit: boolean;
+  focused: boolean;
+  selection: readonly [start: number, end: number, direction: "forward" | "backward" | "none"];
+};
 
 const BOOT_COMPOSER_ID = "openclaw-boot-composer";
 
@@ -52,10 +59,11 @@ export function takeBootComposer(): BootComposerDraft | null {
   if (!textarea) {
     return null;
   }
-  const draft = {
+  const draft: BootComposerDraft = {
     text: textarea.value,
     submit: textarea.hasAttribute("data-submit-queued"),
     focused: textarea.hasAttribute("data-focused"),
+    selection: [textarea.selectionStart, textarea.selectionEnd, textarea.selectionDirection],
   };
   retireBootComposer();
   return draft;

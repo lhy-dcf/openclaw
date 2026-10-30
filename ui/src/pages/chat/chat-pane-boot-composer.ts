@@ -18,8 +18,8 @@ export function adoptBootComposer(
   }
   const composer = getChatComposerState(pane.presentationId);
   const saved = state.chatMessage.trim() ? state.chatMessage : "";
+  const draft = saved ? `${saved}\n${boot.text}` : boot.text;
   if (boot.text) {
-    const draft = saved ? `${saved}\n${boot.text}` : boot.text;
     state.handleChatDraftChange(draft, saved ? (state.chatMentions ?? []) : []);
     if (boot.submit && !saved) {
       queueComposerSubmit(composer, draft);
@@ -28,10 +28,20 @@ export function adoptBootComposer(
   if (!boot.focused) {
     return;
   }
-  if (composer.composerTextarea?.isConnected) {
-    composer.composerTextarea.focus({ preventScroll: true });
-  } else {
+  const textarea = composer.composerTextarea;
+  if (!textarea?.isConnected) {
     // A composer that attaches later takes focus through its own ref.
     composer.restoreComposerFocus = true;
+    return;
   }
+  textarea.focus({ preventScroll: true });
+  // Keep the caret where the operator was editing once the draft renders,
+  // unless a keystroke has already moved past that frame.
+  const offset = draft.length - boot.text.length;
+  const [start, end, direction] = boot.selection;
+  requestAnimationFrame(() => {
+    if (textarea.value === draft && document.activeElement === textarea) {
+      textarea.setSelectionRange(start + offset, end + offset, direction);
+    }
+  });
 }
