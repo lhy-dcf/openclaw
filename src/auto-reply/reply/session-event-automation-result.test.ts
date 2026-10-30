@@ -18,7 +18,8 @@ import { readSessionEntryInWorker } from "../../config/sessions/session-entry-re
 import { resolveAdmittedCronCompletionStatus } from "../../cron/completion-status.js";
 import { makeCronJob } from "../../cron/delivery.test-helpers.js";
 import { TEST_SCHEDULED_OCCURRENCE } from "../../cron/scheduled-occurrence.test-support.js";
-import { runCronSessionTurn } from "../../cron/session-run.js";
+import { runGatewayCronSessionEvent } from "../../gateway/server-cron-event-dispatch.js";
+import { createGatewayCronTargetResolver } from "../../gateway/server-cron-targets.js";
 import { peekSystemEventEntries, resetSystemEventsForTest } from "../../infra/system-events.js";
 import {
   captureActivePluginRegistrySnapshot,
@@ -58,21 +59,38 @@ it.for([
   { result: "progress", notification: "conversation" },
   { result: "no_change", notification: "conversation" },
   { result: "progress", notification: "unavailable" },
+  { result: "progress", notification: "native-only" },
+  { result: "progress", notification: "conversation", alias: "main-key" },
+  { result: "progress", notification: "conversation", alias: "agent" },
+  { result: "progress", notification: "other-conversation" },
   { result: "progress", messageTool: true },
   { result: "progress", messageTool: "mirror" },
 ] as const)(
-  "settles automation $result ($notification/$messageTool) through its shared session owner",
+  "settles automation $result ($notification/$messageTool/$alias) through its shared session owner",
   async (scenario, { signal }) => {
     const progress = scenario.result === "progress";
     const failed = scenario.result === "failed";
-    const conversationOnly = "notification" in scenario && scenario.notification === "conversation";
-    const notificationDisabled = "notification" in scenario && scenario.notification === "none";
-    const unavailable = "notification" in scenario && scenario.notification === "unavailable";
+    const notification = "notification" in scenario ? scenario.notification : undefined;
+    const nativeOnly = notification === "native-only";
+    const otherConversation = notification === "other-conversation";
+    const conversationOnly = notification === "conversation" || nativeOnly || otherConversation;
+    const notificationDisabled = notification === "none";
+    const unavailable = notification === "unavailable";
+    const deliveryFails = unavailable || nativeOnly || otherConversation;
+    const alias = "alias" in scenario ? scenario.alias : undefined;
     const result = progress ? { outcome: "progress", summary } : { outcome: "no_change" };
     await withOpenClawTestState(
       { label: "automation-shared-result", env: { OPENCLAW_TEST_FAST: "0" } },
       async (state) => {
         const cfg = completionConfig(state.workspaceDir);
+        if (alias === "main-key") {
+          cfg.session = { mainKey: "primary" };
+        } else if (alias === "agent") {
+          cfg.agents = {
+            ...cfg.agents,
+            entries: { ...cfg.agents?.entries, ops: { workspace: state.workspaceDir } },
+          };
+        }
         setRuntimeConfigSnapshot(cfg);
         await state.writeConfig(cfg);
         openOpenClawStateDatabase();
@@ -102,14 +120,22 @@ it.for([
           ...current,
           channels: [
             ...current.channels.filter((entry) => entry.plugin.id !== "telegram"),
-            ...channels.channels,
+            ...(alias ? [] : channels.channels),
           ],
           channelSetups: [
             ...current.channelSetups.filter((entry) => entry.plugin.id !== "telegram"),
-            ...channels.channelSetups,
+            ...(alias ? [] : channels.channelSetups),
           ],
         });
-        const scope = { agentId: "main", sessionKey: "agent:main:automation-result" };
+        const scope = {
+          agentId: alias === "agent" ? "ops" : "main",
+          sessionKey:
+            alias === "agent"
+              ? "agent:ops:main"
+              : alias === "main-key"
+                ? "agent:main:primary"
+                : "agent:main:automation-result",
+        };
         const sessionId = "automation-result-session";
         const route = { channel: "telegram", to: "-100001", accountId: "default" };
         await replaceSessionEntry(scope, {
@@ -121,10 +147,32 @@ it.for([
           }),
           updatedAt: Date.now(),
         });
+        const source = otherConversation
+          ? {
+              agentId: "main",
+              sessionKey: "agent:main:other",
+              sessionId: "other-session",
+              lifecycleRevision: "original",
+            }
+          : { ...scope, sessionId, lifecycleRevision: "original" };
+        if (otherConversation) {
+          await replaceSessionEntry(source, {
+            sessionId: source.sessionId,
+            lifecycleRevision: source.lifecycleRevision,
+            updatedAt: Date.now(),
+            delivery: normalizeSessionDeliveryState({ context: { channel: "webchat" } }),
+          });
+        }
         const job = {
           ...makeCronJob({
             id: "shared-result-job",
-            sessionTarget: `session:${scope.sessionKey}`,
+            agentId: scope.agentId,
+            sessionTarget:
+              alias === "agent"
+                ? "session:agent:main:main"
+                : alias === "main-key"
+                  ? "session:main"
+                  : `session:${scope.sessionKey}`,
             delivery: notificationDisabled
               ? { mode: "none" }
               : {
@@ -141,7 +189,7 @@ it.for([
               includeReasoning: true,
             },
           }),
-          sourceConversation: { ...scope, sessionId, lifecycleRevision: "original" },
+          sourceConversation: alias ? undefined : source,
         };
         let automationRunId: string | undefined;
         model.mockReset().mockImplementation(async (params) => {
@@ -162,7 +210,15 @@ it.for([
             action: "record_result",
             ...result,
           });
-          const finalPayload = { text: summary };
+          const finalPayload = nativeOnly
+            ? {
+                channelData: {
+                  discord: {
+                    embeds: [{ title: "Report ready", description: "Native report body" }],
+                  },
+                },
+              }
+            : { text: summary };
           if ("messageTool" in scenario && scenario.messageTool === "mirror") {
             setReplyPayloadMetadata(finalPayload, {
               sourceReplyTranscriptMirror: {
@@ -190,17 +246,18 @@ it.for([
           };
         });
         try {
-          const outcome = await runCronSessionTurn({
-            occurrence: TEST_SCHEDULED_OCCURRENCE,
-            ...scope,
-            cfg,
-            job,
-            text: request,
-            admissionSource: "operator-schedule",
-            deliveryAttemptFence: { beforeAttempt: async () => {}, assertCurrent() {} },
-            abortSignal: signal,
-            assertCurrent() {},
-          });
+          const outcome = await runGatewayCronSessionEvent(
+            {
+              occurrence: TEST_SCHEDULED_OCCURRENCE,
+              job,
+              text: request,
+              admissionSource: "operator-schedule",
+              deliveryAttemptFence: { beforeAttempt: async () => {}, assertCurrent() {} },
+              abortSignal: signal,
+              assertCurrent() {},
+            },
+            createGatewayCronTargetResolver(state.env, { warn() {} }).resolveCronTarget,
+          );
           expect(outcome, outcome.error).toMatchObject({
             status: failed ? "error" : "ok",
             executionStarted: true,
@@ -223,14 +280,14 @@ it.for([
               message?.idempotencyKey === `source-result:${automationRunId}`,
           );
           expect(facts.map((fact) => fact?.content)).toEqual(
-            progress ? [[{ type: "text", text: summary }]] : [],
+            progress && !nativeOnly ? [[{ type: "text", text: summary }]] : [],
           );
           if (progress) {
             expect(outcome).toMatchObject({
               summary,
-              delivered: !notificationDisabled && !unavailable,
+              delivered: !notificationDisabled && !deliveryFails,
             });
-            if (unavailable) {
+            if (unavailable || otherConversation) {
               expect(outcome.deliveryError).toBeTruthy();
             } else {
               expect(outcome.deliveryError).toBeUndefined();
@@ -246,8 +303,8 @@ it.for([
                     : "not-delivered",
                 outcome.deliverySuppressionReason,
               ),
-            ).toBe(unavailable ? "failed" : "succeeded");
-            if (conversationOnly) {
+            ).toBe(deliveryFails ? "failed" : "succeeded");
+            if (conversationOnly && !nativeOnly && !otherConversation) {
               expect(outcome.delivery).toMatchObject({ fallbackUsed: true, delivered: true });
               expect(outcome.delivery?.messageToolSentTo).toBeUndefined();
             }

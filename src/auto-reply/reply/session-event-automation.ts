@@ -255,7 +255,7 @@ export async function settleSessionEventTurn(params: {
         committed.diagnostics,
       );
     }
-    return { ...settled, conversationResultCommitted: true };
+    return { ...settled, conversationResultCommitted: committed.skipped ? undefined : true };
   }
   return settled;
 }

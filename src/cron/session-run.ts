@@ -19,6 +19,7 @@ import {
   finalizeCronPromptForResolvedTools,
   resolveCronDeliveryContext,
 } from "./isolated-agent/run-delivery-trace.js";
+import { resolveCronAgentSessionKey } from "./isolated-agent/session-key.js";
 import { CronOperatorSourceError } from "./operator-source-error.js";
 import { appendCronJobScratchPrompt, buildCronCommandBody } from "./run-prompt.js";
 import { isCronScratchEffectivelyEmpty } from "./scratch-contract.js";
@@ -100,7 +101,12 @@ export async function runCronSessionTurn(
       !delivery.resolvedDelivery.sourceConversationUnavailable &&
       !requiresExternalCronDelivery(delivery.deliveryPlan, delivery.resolvedDelivery) &&
       deliverySessionKey &&
-      resolveSystemEventQueueKey(deliverySessionKey, params.agentId) === queueKey,
+      resolveCronAgentSessionKey({
+        sessionKey: deliverySessionKey,
+        agentId: params.agentId,
+        mainKey: params.cfg.session?.mainKey,
+        cfg: params.cfg,
+      }) === queueKey,
     );
     const deliverySuppressionReason =
       delivery && !delivery.resolvedDelivery.ok
