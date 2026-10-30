@@ -87,6 +87,12 @@ configuration changes, Gateway-wide tool invocation, or publication outside
 the own-session shared-account path described above.
 
 Session readers can browse visible conversations and receive their updates.
+They can inspect a visible session's effective tool names with `tools.effective`.
+The session-only response includes core summaries and preserves policy-filtered
+GitHub action descriptions. It omits other runtime descriptions, configuration
+diagnostics, and MCP connection notices.
+Session visibility and requester authority are checked before returning the preview;
+general Gateway read access still receives the full diagnostic response.
 The Control UI can copy visible history as Markdown. Session writers can rename,
 pin, archive, or restore their own existing conversations. Other people's visible
 sessions remain read-only under these grants, including shared sessions.
@@ -123,7 +129,11 @@ their own conversations, fork from a persisted user message in an owned settled
 conversation, use **Advanced → Fork conversation** on their own conversation,
 and stop their own active runs. Whole-conversation forks preserve the saved
 conversation history; while the source is working, they copy through its last
-completed reply. Forking does not grant access to another creator's conversation
+completed reply. A whole-conversation fork of a Draft stays Draft unless the
+creation request explicitly selects another audience. If new Draft creation is
+disabled, creating that Draft copy is refused; the existing Draft remains available
+for continued work.
+Forking does not grant access to another creator's conversation
 or change the source's workspace and isolation rules. Their model, effort,
 fast-mode, and non-full permission choices use the same session grant and the
 Gateway's allowed model catalog. Full permission mode, sandbox changes, and
