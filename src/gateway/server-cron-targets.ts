@@ -234,9 +234,9 @@ export function createGatewayCronTargetResolver(
       });
       return receipt.accepted;
     };
-    const context = jobId && !eventOpts.expectedTarget ? resolveGatewayContext?.() : undefined;
+    const context = jobId ? resolveGatewayContext?.() : undefined;
     const job = jobId ? context?.cron.getJob(jobId) : undefined;
-    if (!job) {
+    if (!context || !job) {
       return enqueue();
     }
     // A notice about a job acts for the job's requester, like the job's own runs.

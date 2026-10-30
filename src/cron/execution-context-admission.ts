@@ -25,7 +25,6 @@ import {
   buildScheduledExecutionContext,
   classifyScheduledParent,
   resolveScheduledPrincipal,
-  resolveScheduledRequester,
   type ScheduledAdmissionFacts,
   type ScheduledExecutionContextResult,
   type ScheduledRequesterRef,
@@ -77,8 +76,11 @@ function ownerCheck(cfg: OpenClawConfig, isOwner: (current: OpenClawConfig) => b
   };
 }
 
-/** Owner check for requesters the occurrence can verify; operator sources are checked per run. */
-async function checkRequesterOwner(
+/**
+ * Owner check for requesters the occurrence can verify; operator sources are checked per run.
+ * Scheduler turns about a job (its repair or notices) take the same check.
+ */
+export async function checkRequesterOwner(
   cfg: OpenClawConfig,
   requester: Exclude<ScheduledRequesterRef, { kind: "operator-source" }>,
 ): Promise<RequesterOwnerCheck> {
@@ -115,31 +117,6 @@ async function checkRequesterOwner(
       return NOT_OWNER;
   }
   return NOT_OWNER;
-}
-
-/**
- * The job requester's current owner check for a scheduler-started turn about the job (a
- * failure repair or notice in its owner conversation). Operator sources are restored by
- * their Gateway owner instead. `requester: false` means the job records no requester.
- */
-export async function prepareCronJobRequesterOwner(
-  cfg: OpenClawConfig,
-  job: Pick<CronStoredJob, "operatorSource" | "toolsAllowProvenance" | "createdActor">,
-): Promise<RequesterOwnerCheck & { requester: boolean }> {
-  let requester: ScheduledRequesterRef;
-  try {
-    requester = resolveScheduledRequester(job);
-  } catch {
-    // An undecodable stored source still names a requester; it is never an owner.
-    return { ...NOT_OWNER, requester: true };
-  }
-  if (requester.kind === "unknown") {
-    return { ...NOT_OWNER, requester: false };
-  }
-  if (requester.kind === "operator-source") {
-    return { ...NOT_OWNER, requester: true };
-  }
-  return { ...(await checkRequesterOwner(cfg, requester)), requester: true };
 }
 
 type ScheduledParentLink = Readonly<{

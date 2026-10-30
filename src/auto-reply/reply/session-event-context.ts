@@ -254,20 +254,18 @@ export function buildSessionEventContext(params: {
   } else if (requesterOwnerCheck) {
     // Work the scheduler started for a job keeps its requester's owner tools only while
     // the requester is still an owner, rechecked before each owner-only effect.
-    const isRequesterCurrent = () => {
-      try {
-        requesterOwnerCheck();
-        return true;
-      } catch {
-        return false;
-      }
-    };
     bindCommandOwnerAuthority(ctx, {
       isCurrent: () => {
         params.assertCurrent();
-        return isRequesterCurrent();
+        requesterOwnerCheck();
+        return true;
       },
-      successor: { isCurrent: isRequesterCurrent },
+      successor: {
+        isCurrent: () => {
+          requesterOwnerCheck();
+          return true;
+        },
+      },
     });
   } else {
     const commandOwner = readSessionEventTargetCommandOwner(target);

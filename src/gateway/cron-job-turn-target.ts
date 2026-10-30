@@ -1,103 +1,78 @@
 import { isDeepStrictEqual } from "node:util";
 import type { SessionEventTarget } from "../auto-reply/reply/session-event-contract.js";
 import { captureSessionEventTargetForHost } from "../auto-reply/reply/session-event-handoff.js";
-import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
-import { prepareCronJobRequesterOwner } from "../cron/execution-context-admission.js";
+import { checkRequesterOwner } from "../cron/execution-context-admission.js";
+import { resolveScheduledRequester } from "../cron/execution-context.js";
 import type { CronStoredJob } from "../cron/types.js";
-import { decodeGatewayOperatorRecoverySource } from "./operator-run-recovery-source.codec.js";
 import { restoreGatewayOperatorSource } from "./operator-run-recovery.js";
 import type { GatewayRequestContext } from "./server-methods/shared-types.js";
 
-type CronJobTurnTarget = { target: SessionEventTarget; release: () => void };
-
 /**
  * Captures the owner conversation for a turn the scheduler starts about one job (its failure
- * repair or a notice), acting for the job's recorded requester: the same requester its
- * scheduled runs act for. An owner requester keeps owner tools while it stays an owner; a
- * non-owner requester gets none; a job with no recorded requester falls back to the
- * session principal like other unattributed system turns.
+ * repair or a notice), acting for the job's recorded requester: the requester its scheduled
+ * runs act for. An owner requester keeps owner tools while it stays an owner; a non-owner
+ * requester gets none; a job with no recorded requester falls back to the session
+ * principal like other unattributed system turns.
  */
 export async function captureCronJobTurnTarget(params: {
   job: CronStoredJob;
   agentId: string;
   sessionKey: string;
-  context?: GatewayRequestContext;
-  assertCurrent?: () => void;
-}): Promise<CronJobTurnTarget> {
-  const { job, agentId, sessionKey } = params;
-  const capture = (options: Parameters<typeof captureSessionEventTargetForHost>[2] = {}) =>
-    captureSessionEventTargetForHost(agentId, sessionKey, {
-      assertCurrent: params.assertCurrent,
-      ...options,
+  context: GatewayRequestContext;
+}): Promise<{ target: SessionEventTarget; release: () => void }> {
+  const { job, agentId, sessionKey, context } = params;
+  const capture = (options?: Parameters<typeof captureSessionEventTargetForHost>[2]) =>
+    captureSessionEventTargetForHost(agentId, sessionKey, options);
+  const nonOwner = async () => ({
+    // A known requester that is not, or no longer, an owner: never the session principal.
+    target: await capture({ requesterOwner: {} }),
+    release: () => {},
+  });
+  let requester: ReturnType<typeof resolveScheduledRequester>;
+  try {
+    requester = resolveScheduledRequester(job);
+  } catch {
+    // An undecodable stored operator source; its scheduled runs fail the same way.
+    return await nonOwner();
+  }
+  if (requester.kind === "unknown") {
+    return { target: await capture(), release: () => {} };
+  }
+  if (requester.kind !== "operator-source") {
+    const owner = await checkRequesterOwner(context.getRuntimeConfig(), requester);
+    const target = await capture({
+      requesterOwner: owner.assertCurrent ? { assertCurrent: owner.assertCurrent } : {},
     });
-  if (job.operatorSource) {
-    const restored = await restoreOperatorSourceTarget({ ...params, capture });
-    // A refused or reset source is still this job's requester: never the session principal.
-    return restored ?? { target: await capture({ requesterOwner: {} }), release: () => {} };
+    return { target, release: () => {} };
   }
-  const cfg = params.context?.getRuntimeConfig() ?? getRuntimeConfigSnapshot();
-  if (!cfg) {
-    throw new Error("Automation turn requires an initialized runtime config");
-  }
-  const requester = await prepareCronJobRequesterOwner(cfg, job);
-  params.assertCurrent?.();
-  const ownerCheck = requester.owner ? requester.assertCurrent : undefined;
-  const target = await capture(
-    requester.requester ? { requesterOwner: ownerCheck ? { assertCurrent: ownerCheck } : {} } : {},
-  );
-  return { target, release: () => {} };
-}
-
-async function restoreOperatorSourceTarget(params: {
-  job: CronStoredJob;
-  agentId: string;
-  sessionKey: string;
-  context?: GatewayRequestContext;
-  assertCurrent?: () => void;
-  capture: (
-    options: Parameters<typeof captureSessionEventTargetForHost>[2],
-  ) => Promise<SessionEventTarget>;
-}): Promise<CronJobTurnTarget | undefined> {
-  const { job, context } = params;
+  // Operator-source jobs are owned by the conversation their source names.
+  const { source } = requester;
   const captured = job.operatorSource;
-  if (!captured || !context) {
-    return undefined;
-  }
   let operator: Awaited<ReturnType<typeof restoreGatewayOperatorSource>> | undefined;
   try {
-    const source = decodeGatewayOperatorRecoverySource(captured.source);
-    // Operator-source jobs are owned by the conversation the source names.
-    if (source.agentId !== params.agentId || source.sessionKey !== params.sessionKey) {
-      return undefined;
+    if (source.agentId !== agentId || source.sessionKey !== sessionKey) {
+      throw new Error("Automation operator source names another conversation");
     }
-    const assertCurrent = () => {
-      params.assertCurrent?.();
-      if (!isDeepStrictEqual(context.cron.getJob(job.id)?.operatorSource, captured)) {
-        throw new Error("Automation operator source changed");
-      }
-    };
     operator = await restoreGatewayOperatorSource({
       snapshot: source.snapshot,
-      target: {
-        agentId: source.agentId,
-        sessionKey: source.sessionKey,
-        sessionId: source.sessionId,
-      },
+      target: { agentId, sessionKey, sessionId: source.sessionId },
       context,
-      assertCurrent,
+      assertCurrent: () => {
+        if (!isDeepStrictEqual(context.cron.getJob(job.id)?.operatorSource, captured)) {
+          throw new Error("Automation operator source changed");
+        }
+      },
     });
-    const target = await params.capture({
+    const target = await capture({
       operatorAuthority: operator.authority,
       ownerContinuation: true,
     });
     if (target.sessionId !== source.sessionId) {
       throw new Error("Automation owner conversation was reset");
     }
-    const release = operator.release;
-    operator = undefined;
-    return { target, release };
+    return { target, release: operator.release };
   } catch {
     operator?.release();
-    return undefined;
+    return await nonOwner();
   }
 }
