@@ -13,7 +13,7 @@ type RepairTurnContext = Parameters<typeof gatewayReplyMock>[0];
  * dispatch; only the model call is synthetic. `respond` decides the turn's result.
  */
 export function installCronRepairTurn(
-  respond: (params: RunEmbeddedAgentParams) => Promise<string>,
+  respond: (params: RunEmbeddedAgentParams) => Promise<string | { error: string }>,
 ): { context: () => RepairTurnContext | undefined } {
   let repairContext: RepairTurnContext | undefined;
   gatewayReplyMock.mockImplementationOnce((ctx, options, config) => {
@@ -30,12 +30,16 @@ export function installCronRepairTurn(
     params.onExecutionPhase?.({ phase: "model_call_started" });
     await params.onExecutionStarted?.();
     await params.onAgentEvent?.({ stream: "lifecycle", data: { phase: "start" } });
-    const text = await respond(params);
+    const reply = await respond(params);
+    if (typeof reply !== "string") {
+      // A runtime failure the reply runtime reports as an error payload (timeout, provider).
+      return { payloads: [{ text: reply.error, isError: true }], meta: { durationMs: 1 } };
+    }
     return {
-      payloads: [{ text }],
+      payloads: [{ text: reply }],
       meta: {
         durationMs: 1,
-        terminalReply: { disposition: text === "NO_REPLY" ? "silent" : "visible", text },
+        terminalReply: { disposition: reply === "NO_REPLY" ? "silent" : "visible", text: reply },
       },
     };
   });

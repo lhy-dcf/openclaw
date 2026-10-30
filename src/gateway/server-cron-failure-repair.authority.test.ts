@@ -1,12 +1,14 @@
 import "../test-utils/prepare-compiled-subprocesses.js";
 import { expect, it, vi } from "vitest";
 import { runEmbeddedAgent } from "../agents/embedded-agent.js";
+import * as gatewayCallerAvailability from "../agents/tools/gateway-caller-availability.js";
+import * as inProcessGateway from "../agents/tools/in-process-gateway.js";
 import {
   configureEventState,
   openEventToolHost,
   runEventFixture,
 } from "../auto-reply/reply/session-event.test-support.js";
-import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
+import { getRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import type { CronStoredJob } from "../cron/types.js";
 import { createGatewayCronFailureRepair } from "./server-cron-notifications.js";
@@ -25,15 +27,27 @@ await Promise.all([
 
 const ownerSessionKey = "agent:main:telegram:direct:456";
 const jobId = "repair-authority-job";
-const ownerRequester = { version: 1, channel: "telegram", accountId: "default", senderId: "456" };
+const requesterOf = (senderId: string) => ({
+  version: 1,
+  channel: "telegram",
+  accountId: "default",
+  senderId,
+});
 
-// What the repair turn could do with the job it repairs, by the job's recorded requester.
-// "gateway" means the call passed the turn's owner gate and reached the Gateway transport.
+// What the repair turn's `automations update` of its own job did, by the job's requester.
+// `sent` lists the Gateway cron methods the turn's tools actually called.
 const outcomes = {
-  // An owner requester: the turn reads and updates the job.
-  owner: { senderIsOwner: true, get: "gateway", update: "gateway" },
+  owner: { senderIsOwner: true, update: "ok", sent: ["cron.update"] },
   // A known non-owner requester never falls back to the session principal.
-  "non-owner": { senderIsOwner: false, update: "gated" },
+  "non-owner": { senderIsOwner: false, update: "gated", sent: [] },
+  // Revoked while the repair waited for admission.
+  "revoked-before-admission": { senderIsOwner: false, update: "gated", sent: [] },
+  // Revoking publishes config, which retires the admitted turn's tool host before the write.
+  "revoked-after-admission": {
+    senderIsOwner: true,
+    update: "agent harness host capability is no longer active",
+    sent: [],
+  },
 } as const;
 
 it.for(Object.keys(outcomes) as Array<keyof typeof outcomes>)(
@@ -44,52 +58,61 @@ it.for(Object.keys(outcomes) as Array<keyof typeof outcomes>)(
         channels: { telegram: {} },
         commands: { ownerAllowFrom: ["456"] },
       });
+      const revoke = () =>
+        setRuntimeConfigSnapshot({ ...config, commands: { ownerAllowFrom: ["789"] } });
       await replaceSessionEntry(
         { agentId: "main", sessionKey: ownerSessionKey },
         { sessionId: "repair-owner", updatedAt: Date.now() },
       );
       const job = {
         id: jobId,
-        name: "ClawSweeper health",
+        name: "Health check",
         owner: { agentId: "main", sessionKey: ownerSessionKey },
         toolsAllowProvenance: {
-          channelRequester:
-            requester === "non-owner" ? { ...ownerRequester, senderId: "789" } : ownerRequester,
+          channelRequester: requesterOf(requester === "non-owner" ? "789" : "456"),
         },
       } as unknown as CronStoredJob;
       const context = {
         cron: { getJob: (id: string) => (id === jobId ? job : undefined) },
         getRuntimeConfig: () => getRuntimeConfigSnapshot()!,
       } as unknown as GatewayRequestContext;
+      // Only the in-process Gateway transport is recorded; the turn's own gates decide.
+      const sent: string[] = [];
+      const spies = [
+        vi.spyOn(gatewayCallerAvailability, "hasInProcessGatewayToolCaller").mockReturnValue(true),
+        vi
+          .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
+          .mockImplementation(async (request) => {
+            sent.push(request.method);
+            return { id: jobId } as never;
+          }),
+      ];
+      onTestFinished(() => spies.forEach((spy) => spy.mockRestore()));
+
       let senderIsOwner: boolean | undefined;
-      const results: Record<string, string> = {};
+      let update: string | undefined;
       runEmbeddedAgentMock.mockReset().mockImplementation(async (params) => {
         const { tools, close } = await openEventToolHost(params, "repair admission", {
           includeOpenClawTools: true,
         });
         senderIsOwner = params.senderIsOwner;
-        const automations = tools.find((tool) => tool.name === "automations")!;
-        try {
-          for (const [action, args] of [
-            ["get", { action: "get", jobId }],
-            ["update", { action: "update", jobId, job: { description: "repaired" } }],
-          ] as const) {
-            // A gated call settles without reaching the Gateway; a passed one reaches the
-            // transport, which this fixture does not run.
-            const details = await automations.execute(`repair-${action}`, args).then(
-              (result) => result.details as { gated?: boolean } | undefined,
-              () => undefined,
-            );
-            results[action] = details?.gated ? "gated" : "gateway";
-          }
-          if (requester === "non-owner") {
-            delete results.get;
-          }
-        } finally {
-          close();
+        if (requester === "revoked-after-admission") {
+          revoke();
         }
+        update = await tools
+          .find((tool) => tool.name === "automations")!
+          .execute("repair-update", { action: "update", jobId, job: { description: "fixed" } })
+          .then(
+            (result) =>
+              (result.details as { gated?: boolean } | undefined)?.gated ? "gated" : "ok",
+            (error: unknown) => (error instanceof Error ? error.message : String(error)),
+          )
+          .finally(close);
         return { payloads: [{ text: "Repaired." }], meta: { durationMs: 1 } };
       });
+      if (requester === "revoked-before-admission") {
+        revoke();
+      }
 
       const { runCronFailureRepair } = createGatewayCronFailureRepair(config, () => context);
       await runCronFailureRepair({
@@ -101,7 +124,11 @@ it.for(Object.keys(outcomes) as Array<keyof typeof outcomes>)(
         message: "Automation repair request from the scheduler, not a user message.",
       });
 
-      expect({ senderIsOwner, ...results }).toEqual(outcomes[requester]);
+      expect({
+        senderIsOwner,
+        update,
+        sent: sent.filter((method) => method.startsWith("cron.")),
+      }).toEqual(outcomes[requester]);
     });
   },
 );

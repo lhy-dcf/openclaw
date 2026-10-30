@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi 
 import type WebSocket from "ws";
 import { createInfoWarnErrorLogger } from "../../test/helpers/mock-logger.js";
 import { createDeferred, withinTest } from "../../test/helpers/promise.js";
+import * as sessionEventDelivery from "../auto-reply/reply/session-event-delivery.js";
 import { resetConfigRuntimeState } from "../config/config.js";
 import type * as CronDelivery from "../cron/delivery.js";
 import { readCronRunRecordsForTests } from "../cron/run-history.test-support.js";
@@ -1034,13 +1035,12 @@ describe("gateway server cron", () => {
       await prepareGatewayReplyRuntimeForTest({ force: true });
       const repairTurnStarted = createDeferred();
       const finishRepairTurn = createDeferred();
+      // A repair's runtime error stays out of the owner chat; the next alert escalates.
+      const chatDelivery = vi.spyOn(sessionEventDelivery, "prepareSessionEventDelivery");
       const repairTurn = installCronRepairTurn(async () => {
         repairTurnStarted.resolve();
         await finishRepairTurn.promise;
-        if (outcome === "error") {
-          throw new Error("repair command failed");
-        }
-        return "NO_REPLY";
+        return outcome === "error" ? { error: "The model provider timed out." } : "NO_REPLY";
       });
       cronIsolatedRun.mockResolvedValue({ status: "error", error: "scripts/sync.md is missing" });
       const added = await request(
@@ -1093,6 +1093,8 @@ describe("gateway server cron", () => {
           ?.repair;
         expect(repair?.settledAtMs).toEqual(expect.any(Number));
       });
+      expect(chatDelivery).not.toHaveBeenCalled();
+      chatDelivery.mockRestore();
       await run(jobId);
       await vi.waitFor(() => expect(sendCronAnnouncePayloadStrictMock).toHaveBeenCalledOnce());
       await run(jobId);

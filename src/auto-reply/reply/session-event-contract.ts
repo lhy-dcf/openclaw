@@ -113,6 +113,8 @@ export type SessionEventOptions = {
   preserveOccurrenceOnRejection?: true;
   /** An explicitly silent source records its result without transport delivery. */
   deliver?: boolean;
+  /** Host-owned: runtime error payloads stay in the transcript, out of chat delivery. */
+  suppressErrorDelivery?: true;
   /** Host producer remains live through admission, execution and delivery. */
   assertCurrent?: () => void;
 };

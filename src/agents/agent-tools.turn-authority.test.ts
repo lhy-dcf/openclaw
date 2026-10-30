@@ -121,7 +121,9 @@ describe("resolveTurnToolSurface on a system turn", () => {
   ] as const)(
     "recognizes trigger=%s provenance=%s/%s as a host system turn: %s",
     (trigger, kind, sourceTool, expected) => {
-      expect(isHostSystemTurn({ trigger, inputProvenance: { kind, sourceTool } })).toBe(expected);
+      // A full provenance record: its label must not change the rule.
+      const inputProvenance: { kind: string; sourceTool: string } = { kind, sourceTool };
+      expect(isHostSystemTurn({ trigger, inputProvenance })).toBe(expected);
     },
   );
 

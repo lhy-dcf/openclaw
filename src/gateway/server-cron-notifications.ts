@@ -80,7 +80,8 @@ export function createGatewayCronFailureRepair(
  * The owner conversation receives the repair request as a host system turn, with the reply
  * delivered to its last route (thread included). The turn acts for the job's requester, as
  * the job's own runs do, so an owner requester can inspect and update the job it repairs.
- * The job's next failure alert owns escalation.
+ * Runtime error payloads (timeouts, provider errors) are not posted; the job's next failure
+ * alert owns escalation.
  */
 async function runGatewayCronFailureRepair(
   request: CronFailureRepairRequest,
@@ -112,6 +113,8 @@ async function runGatewayCronFailureRepair(
         source: "cron_failure_repair",
         contextKey: `cron-failure-repair:${request.repairId}`,
         expectedTarget: target,
+        // Only the agent's authored reply reaches the chat; the next alert owns escalation.
+        suppressErrorDelivery: true,
       });
       const accepted = await receipt.accepted;
       if (!accepted.ok) {
