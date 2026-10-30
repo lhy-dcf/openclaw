@@ -188,7 +188,7 @@ export async function prepareCodexAttemptRuntime(connection: CodexAttemptConnect
         ...(startupAuthProfileId ? { authProfileId: startupAuthProfileId } : {}),
       };
   const startupAuthAccountCacheKey =
-    usesSupervisionConnection || connection.workerHostedCloud
+    usesSupervisionConnection || connection.workerHostedCloud || connection.nativeCommandAuth
       ? undefined
       : startupPreparedAuth?.kind === "api-key"
         ? resolveCodexAppServerPreparedApiKeyCacheKey(startupPreparedAuth.apiKey)
@@ -203,6 +203,7 @@ export async function prepareCodexAttemptRuntime(connection: CodexAttemptConnect
   const startupEnvApiKeyCacheKey =
     usesSupervisionConnection ||
     connection.workerHostedCloud ||
+    connection.nativeCommandAuth ||
     startupPreparedAuth ||
     startupAuthProfileId
       ? undefined

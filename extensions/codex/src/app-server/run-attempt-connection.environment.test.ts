@@ -404,3 +404,79 @@ it("keeps non-node remote placements confined when worker hosting is configured"
     }),
   ).rejects.toThrow("requires an enrolled node");
 });
+
+it.each(["ordinary", "ordinary-profile", "worker"] as const)(
+  "keeps native-command auth within its admitted %s placement boundary",
+  async (placement) => {
+    const params = createParams(
+      path.join(tempDir, "native-placement.jsonl"),
+      path.join(tempDir, "native-placement"),
+    );
+    params.permissionMode = "full";
+    params.provider = "command-fixture";
+    params.model = {
+      ...params.model,
+      provider: params.provider,
+      api: "openai-responses",
+      baseUrl: "https://native.example.test/v1",
+    };
+    params.runtimePlan = {
+      ...createCodexRuntimePlanFixture(),
+      auth: {
+        providerForAuth: params.provider,
+        authProfileProviderForAuth: params.provider,
+        selectedAuthMode: "native-command",
+        credentialSource: { kind: "none" },
+      },
+    };
+    const readHostProfiles = vi.fn(() => {
+      throw new Error("Unexpected host profile lookup");
+    });
+    params.authProfileStore = {
+      version: 1,
+      get profiles() {
+        return readHostProfiles();
+      },
+    };
+    if (placement === "worker") {
+      const sandbox = {
+        ...createSandboxContext({}),
+        backendId: "node",
+        placementExecutionMode: "remote-exec",
+        placementNodeId: "worker-node",
+      };
+      params.sandbox = sandbox;
+    }
+    if (placement === "ordinary-profile") {
+      params.authProfileId = "openai:chosen";
+    }
+    const runtime = createPluginRuntimeMock();
+    const open = vi.spyOn(runtime.nodes, "openDuplex");
+    const preparation = prepareCodexAttemptConnection({
+      params,
+      options: {
+        bindingStore: testCodexAppServerBindingStore,
+        runtime,
+        pluginConfig: { appServer: { workerHostedCloud: true } },
+      },
+    });
+    if (placement !== "ordinary") {
+      await expect(preparation).rejects.toThrow(
+        "Native command auth cannot use host credentials or remote-exec placement",
+      );
+    } else {
+      const connection = await preparation;
+      try {
+        expect(connection.startupAuthRequirement).toBe("native-command");
+        expect(connection.startupClientAuthProfileId).toBeNull();
+        expect(connection.startupPreparedAuth).toBeUndefined();
+      } finally {
+        connection.cancellation.dispose();
+        connection.releaseModelExecution();
+        connection.releaseBindingAuthority();
+      }
+    }
+    expect(open).not.toHaveBeenCalled();
+    expect(readHostProfiles).not.toHaveBeenCalled();
+  },
+);
