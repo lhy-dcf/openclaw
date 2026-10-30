@@ -15,6 +15,7 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import { readTranscriptEventMessage } from "../../config/sessions/session-accessor.sqlite-read.js";
 import { readSessionEntryInWorker } from "../../config/sessions/session-entry-read-writable.js";
+import { resolveAdmittedCronCompletionStatus } from "../../cron/completion-status.js";
 import { makeCronJob } from "../../cron/delivery.test-helpers.js";
 import { TEST_SCHEDULED_OCCURRENCE } from "../../cron/scheduled-occurrence.test-support.js";
 import { runCronSessionTurn } from "../../cron/session-run.js";
@@ -54,6 +55,9 @@ it.for([
   { result: "no_change" },
   { result: "failed" },
   { result: "progress", notification: "none" },
+  { result: "progress", notification: "conversation" },
+  { result: "no_change", notification: "conversation" },
+  { result: "progress", notification: "unavailable" },
   { result: "progress", messageTool: true },
   { result: "progress", messageTool: "mirror" },
 ] as const)(
@@ -61,6 +65,9 @@ it.for([
   async (scenario, { signal }) => {
     const progress = scenario.result === "progress";
     const failed = scenario.result === "failed";
+    const conversationOnly = "notification" in scenario && scenario.notification === "conversation";
+    const notificationDisabled = "notification" in scenario && scenario.notification === "none";
+    const unavailable = "notification" in scenario && scenario.notification === "unavailable";
     const result = progress ? { outcome: "progress", summary } : { outcome: "no_change" };
     await withOpenClawTestState(
       { label: "automation-shared-result", env: { OPENCLAW_TEST_FAST: "0" } },
@@ -109,19 +116,33 @@ it.for([
           sessionId,
           lifecycleRevision: "original",
           permissionMode: "full",
-          delivery: normalizeSessionDeliveryState({ context: route }),
+          delivery: normalizeSessionDeliveryState({
+            context: conversationOnly ? { channel: "webchat" } : route,
+          }),
           updatedAt: Date.now(),
         });
-        const job = makeCronJob({
-          id: "shared-result-job",
-          sessionTarget: `session:${scope.sessionKey}`,
-          delivery: "notification" in scenario ? { mode: "none" } : { mode: "announce", ...route },
-          payload: {
-            kind: "agentTurn",
-            message: request,
-            includeReasoning: true,
-          },
-        });
+        const job = {
+          ...makeCronJob({
+            id: "shared-result-job",
+            sessionTarget: `session:${scope.sessionKey}`,
+            delivery: notificationDisabled
+              ? { mode: "none" }
+              : {
+                  mode: "announce",
+                  ...(conversationOnly
+                    ? {}
+                    : unavailable
+                      ? { channel: "missing-channel", to: "recipient" }
+                      : route),
+                },
+            payload: {
+              kind: "agentTurn",
+              message: request,
+              includeReasoning: true,
+            },
+          }),
+          sourceConversation: { ...scope, sessionId, lifecycleRevision: "original" },
+        };
         let automationRunId: string | undefined;
         model.mockReset().mockImplementation(async (params) => {
           await admitModelTurn(params);
@@ -205,7 +226,31 @@ it.for([
             progress ? [[{ type: "text", text: summary }]] : [],
           );
           if (progress) {
-            expect(outcome).toMatchObject({ summary, delivered: !("notification" in scenario) });
+            expect(outcome).toMatchObject({
+              summary,
+              delivered: !notificationDisabled && !unavailable,
+            });
+            if (unavailable) {
+              expect(outcome.deliveryError).toBeTruthy();
+            } else {
+              expect(outcome.deliveryError).toBeUndefined();
+            }
+            expect(
+              resolveAdmittedCronCompletionStatus(
+                job,
+                "ok",
+                notificationDisabled
+                  ? "not-requested"
+                  : outcome.delivered
+                    ? "delivered"
+                    : "not-delivered",
+                outcome.deliverySuppressionReason,
+              ),
+            ).toBe(unavailable ? "failed" : "succeeded");
+            if (conversationOnly) {
+              expect(outcome.delivery).toMatchObject({ fallbackUsed: true, delivered: true });
+              expect(outcome.delivery?.messageToolSentTo).toBeUndefined();
+            }
             expect(sendText.mock.calls.map(([sent]) => sent.text)).toEqual(
               "notification" in scenario || "messageTool" in scenario
                 ? []
@@ -218,6 +263,14 @@ it.for([
               summary: undefined,
             });
             expect(sendText).not.toHaveBeenCalled();
+            expect(
+              resolveAdmittedCronCompletionStatus(
+                job,
+                "ok",
+                "not-delivered",
+                outcome.deliverySuppressionReason,
+              ),
+            ).toBe("succeeded");
           } else {
             expect(sendText.mock.calls.some(([sent]) => sent.text.includes(failure))).toBe(true);
           }
