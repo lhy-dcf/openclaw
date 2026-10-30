@@ -12,7 +12,8 @@ vi.mock("../auto-reply/reply/session-event-handoff.js", async (importOriginal) =
   enqueueSessionEventForHost: mocks.enqueueSessionEventForHost,
 }));
 
-vi.mock("./cron-job-turn-target.js", () => ({
+vi.mock("./cron-job-turn-target.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./cron-job-turn-target.js")>()),
   captureCronJobTurnTarget: mocks.captureCronJobTurnTarget,
 }));
 
