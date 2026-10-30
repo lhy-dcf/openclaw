@@ -8,6 +8,7 @@ import type { SandboxContext } from "openclaw/plugin-sdk/sandbox";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveCodexWorkerAppServerCommand } from "../node-app-server-command.js";
 import { applyCodexAppServerAuthProfile } from "./auth-bridge.js";
+import { ensureCodexAppServerClientRuntime } from "./client-runtime.js";
 import { CodexAppServerClient } from "./client.js";
 import { readCodexPlacementWorkspaceIdentity } from "./sandbox-exec-server.js";
 import { trackIsolatedCodexAppServerClient } from "./shared-client-lifecycle.js";
@@ -154,6 +155,9 @@ export function createCodexWorkerClientFactory(params: {
       },
     };
     const client = CodexAppServerClient.fromTransport(transport);
+    // Thread custody belongs to this physical client, but credentials stay on
+    // the worker. Later attempt initialization must not adopt Gateway auth.
+    ensureCodexAppServerClientRuntime(client, { config: options?.config });
     trackIsolatedCodexAppServerClient(client);
     const unsubscribe = channel.onMessage(async (frame) => {
       if (closed) {
