@@ -89,7 +89,9 @@ export type SessionEventOptions = {
     | "plugin"
     // A yielded tool's result resuming its own conversation; hidden from chat display.
     | "tool_handoff"
-    | "cron";
+    | "cron"
+    // The scheduler's repair request for a failing job; hidden from chat display.
+    | "cron_failure_repair";
   contextKey?: string;
   /** Stable identity for durable host producers across restart handoffs. */
   sourceTurnId?: string;

@@ -34,13 +34,13 @@ import {
   runCronJobAndWaitForFinished,
   waitForCronEvent,
 } from "./server-cron.events.test-support.js";
+import { installCronRepairTurn } from "./server.cron-repair-turn.test-support.js";
 import { registerCronRepairCases } from "./server.cron-repair.cases.js";
 import {
   expectCronJobIdFromResponse,
   expectCronRows as rows,
 } from "./server.cron.assertions.test-support.js";
 import {
-  agentCommandMock,
   connectOk,
   cronIsolatedRun,
   installGatewayTestHooks,
@@ -50,6 +50,10 @@ import {
   testState,
   writeSessionStore,
 } from "./test-helpers.js";
+import { gatewayReplyMock } from "./test-helpers.runtime-state.js";
+
+// mock-isolation: Synthetic model only; repair turns keep real session-event admission.
+vi.mock("../agents/embedded-agent-runner/run.js", () => ({ runEmbeddedAgent: vi.fn() }));
 
 const fetchWithSsrFGuardMock = vi.hoisted(() =>
   vi.fn(async (params: GuardedFetchOptions) => ({
@@ -993,7 +997,6 @@ describe("gateway server cron", () => {
       const group = "-100155462274";
       const ownerSessionKey = `agent:main:telegram:group:${group}:topic:42`;
       const hour = new Date().getUTCHours();
-      testState.agentConfig = { timeoutSeconds: 91 };
       testState.sessionStorePath = path.join(caseDir, "sessions.json");
       await writeSessionStore({
         agentId: "main",
@@ -1031,12 +1034,13 @@ describe("gateway server cron", () => {
       await prepareGatewayReplyRuntimeForTest({ force: true });
       const repairTurnStarted = createDeferred();
       const finishRepairTurn = createDeferred();
-      agentCommandMock.mockImplementationOnce(async () => {
+      const repairTurn = installCronRepairTurn(async () => {
         repairTurnStarted.resolve();
         await finishRepairTurn.promise;
         if (outcome === "error") {
           throw new Error("repair command failed");
         }
+        return "NO_REPLY";
       });
       cronIsolatedRun.mockResolvedValue({ status: "error", error: "scripts/sync.md is missing" });
       const added = await request(
@@ -1057,16 +1061,16 @@ describe("gateway server cron", () => {
         await run(jobId);
 
         await withinTest(repairTurnStarted.promise, signal);
-        expect(agentCommandMock).toHaveBeenCalledOnce();
-        // The owner topic's own session and route: no periodic-job session or runtime warnings.
-        expect(agentCommandMock.mock.calls[0]?.[0]).toMatchObject({
-          sessionKey: ownerSessionKey,
-          deliver: true,
-          channel: "telegram",
-          to: group,
-          threadId: 42,
-          message: expect.stringContaining("Automation repair request from the scheduler"),
-          internalDeliverySuppressErrors: true,
+        expect(gatewayReplyMock).toHaveBeenCalledOnce();
+        // The owner topic's own session and route, as a host system turn: no periodic-job session.
+        expect(repairTurn.context()).toMatchObject({
+          SessionKey: ownerSessionKey,
+          InternalTurnSource: "event",
+          InputProvenance: { kind: "internal_system", sourceTool: "cron_failure_repair" },
+          OriginatingChannel: "telegram",
+          OriginatingTo: group,
+          MessageThreadId: 42,
+          BodyForAgent: expect.stringContaining("Automation repair request from the scheduler"),
         });
 
         // Dispatch acceptance is not repair completion: a retry while the turn is held
@@ -1078,9 +1082,8 @@ describe("gateway server cron", () => {
           state: { lastFailureNotificationDeliveryStatus: "not-requested" },
         });
         expect(sendCronAnnouncePayloadStrictMock).not.toHaveBeenCalled();
-        expect(agentCommandMock).toHaveBeenCalledOnce();
+        expect(gatewayReplyMock).toHaveBeenCalledOnce();
         expect(cronIsolatedRun).toHaveBeenCalledTimes(3);
-        expect(agentCommandMock.mock.calls[0]?.[0]).toMatchObject({ timeout: "91" });
       } finally {
         finishRepairTurn.resolve();
       }
